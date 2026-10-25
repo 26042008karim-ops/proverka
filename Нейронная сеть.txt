@@ -1,0 +1,247 @@
+import sys
+import os
+
+# Принудительно ставим UTF-8 (с защитой для .exe)
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr is not None:
+    sys.stderr.reconfigure(encoding='utf-8')
+
+import customtkinter as ctk
+import threading
+import json
+import re
+import requests
+from bs4 import BeautifulSoup
+from openai import OpenAI
+
+# --- 1. НАСТРОЙКИ ---
+OPENAI_API_KEY = "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"
+
+os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10808'
+os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10808'
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1", 
+    api_key=OPENAI_API_KEY,
+    default_headers={"Content-Type": "application/json; charset=utf-8"}
+)
+
+# --- 2. НАСТРОЙКИ ОКНА ---
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+BASE_SYSTEM_PROMPT = """
+Ты — эксперт по факт-чекингу. Проанализируй новость и ответь СТРОГО в формате JSON:
+{
+  "source_trust": "низкое/среднее/высокое",
+  "source_reason": "почему такой вердикт (1 предложение)",
+  "clickbait_score": 0-100,
+  "clickbait_phrases": ["фраза1", "фраза2"],
+  "truth_risk": "низкий/средний/высокий",
+  "explanation": "объясни суть новости простыми словами (2-3 предложения)",
+  "terms": ["термин1: объяснение", "термин2: объяснение"],
+  "action_advice": "что делать пользователю (1-2 предложения)"
+}
+"""
+
+PARANOIA_PROMPT = """
+ВНИМАНИЕ! ВКЛЮЧЕН РЕЖИМ ПАРАНОЙИ. 
+Будь максимально подозрительным. Ищи скрытый смысл, скрытые угрозы, манипуляции и подтекст даже в самых безобидных словах. 
+Если в тексте есть хоть малейший намек на заговор или пропаганду — резко повышай индекс кликбейта и понижай доверие.
+"""
+
+class FactCheckApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("AI Fact-Checker Pro")
+        self.geometry("1000x700")
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        # Переменная для хранения текста отчета
+        self.current_report_text = ""
+
+        # --- ЛЕВАЯ ПАНЕЛЬ ---
+        self.sidebar_frame = ctk.CTkFrame(self, width=350, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(3, weight=1)
+
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="🛡️ Fact Checker", font=ctk.CTkFont(size=24, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+
+        self.instruction = ctk.CTkLabel(self.sidebar_frame, text="Вставьте текст новости\nили ссылку (http://...):", text_color="gray")
+        self.instruction.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="w")
+
+        self.text_input = ctk.CTkTextbox(self.sidebar_frame, height=250) # Чуть уменьшили высоту
+        self.text_input.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
+
+        # Кнопка вставки из буфера
+        self.paste_button = ctk.CTkButton(self.sidebar_frame, text="📋 Вставить из буфера", fg_color="#555555", hover_color="#444444", command=self.paste_from_clipboard)
+        self.paste_button.grid(row=3, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+        # РЕЖИМ ПАРАНОЙИ
+        self.paranoia_var = ctk.StringVar(value="off")
+        self.paranoia_switch = ctk.CTkSwitch(self.sidebar_frame, text="👁️ Режим паранойи", variable=self.paranoia_var, onvalue="on", offvalue="off", progress_color="#e74c3c")
+        self.paranoia_switch.grid(row=4, column=0, padx=20, pady=(0, 10), sticky="w")
+
+        self.analyze_button = ctk.CTkButton(self.sidebar_frame, text="🔍 Анализировать", font=ctk.CTkFont(size=16, weight="bold"), command=self.start_analysis)
+        self.analyze_button.grid(row=5, column=0, padx=20, pady=(0, 20), sticky="ew")
+
+        self.progress = ctk.CTkProgressBar(self.sidebar_frame, mode="indeterminate")
+        self.progress.grid(row=6, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.progress.set(0)
+
+        # --- ПРАВАЯ ПАНЕЛЬ ---
+        self.result_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
+        self.result_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.result_frame.grid_columnconfigure(0, weight=1)
+
+        self.welcome_label = ctk.CTkLabel(self.result_frame, text="Здесь появится результат анализа...", font=ctk.CTkFont(size=16))
+        self.welcome_label.pack(pady=50)
+
+    def paste_from_clipboard(self):
+        try:
+            text = self.clipboard_get()
+            self.text_input.insert("insert", text)
+        except Exception:
+            pass
+
+    def copy_report(self):
+        if self.current_report_text:
+            self.clipboard_clear()
+            self.clipboard_append(self.current_report_text)
+            self.copy_button.configure(text="✅ Скопировано!", fg_color="#2ecc71")
+            self.after(2000, lambda: self.copy_button.configure(text="📋 Скопировать отчет", fg_color="#555555"))
+
+    def start_analysis(self):
+        text = self.text_input.get("1.0", "end-1c").strip()
+        if not text: return
+
+        for widget in self.result_frame.winfo_children():
+            widget.destroy()
+        
+        self.current_report_text = ""
+        self.analyze_button.configure(state="disabled", text="⏳ Анализ...")
+        self.paste_button.configure(state="disabled")
+        self.progress.start()
+        
+        # Проверяем, включен ли режим паранойи
+        is_paranoid = (self.paranoia_var.get() == "on")
+        threading.Thread(target=self.run_llm_analysis, args=(text, is_paranoid), daemon=True).start()
+
+    def run_llm_analysis(self, text, is_paranoid):
+        if text.startswith("http"):
+            self.after(0, self.show_info_message, "Читаю статью по ссылке...")
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                response = requests.get(text, headers=headers, timeout=10)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for script in soup(["script", "style", "nav", "footer", "header"]):
+                    script.decompose()
+                text_content = soup.get_text(separator=' ', strip=True)
+                text = text_content[:4000] 
+                if len(text) < 50:
+                    raise Exception("Не удалось извлечь текст со страницы.")
+            except Exception as e:
+                self.after(0, self.display_error, f"Ошибка чтения ссылки: {e}")
+                return
+
+        try:
+            # Собираем итоговый промпт в зависимости от режима
+            final_prompt = BASE_SYSTEM_PROMPT
+            if is_paranoid:
+                final_prompt += PARANOIA_PROMPT
+                self.after(0, self.show_info_message, "👁️ Режим паранойи активирован. Ищу скрытые угрозы...")
+
+            response = client.chat.completions.create(
+                model="openrouter/free",
+                messages=[
+                    {"role": "system", "content": final_prompt},
+                    {"role": "user", "content": f"Проверь этот текст:\n\n{text}"}
+                ],
+                temperature=0.3 if is_paranoid else 0.2, # Чуть больше креатива в паранойе
+                timeout=60
+            )
+            
+            result_text = response.choices[0].message.content
+            
+            if not result_text:
+                raise Exception("Нейросеть вернула пустой ответ.")
+
+            result_text = re.sub(r'```json|```', '', result_text).strip()
+            
+            start_idx = result_text.find('{')
+            end_idx = result_text.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                result_text = result_text[start_idx:end_idx+1]
+
+            try:
+                data = json.loads(result_text)
+            except json.JSONDecodeError:
+                raise Exception("Ошибка формата данных. Модель затупила.")
+            
+            self.after(0, self.display_results, data)
+
+        except Exception as e:
+            self.after(0, self.display_error, f"Ошибка: {str(e)}")
+
+    def show_info_message(self, msg):
+        self.welcome_label.configure(text=msg)
+
+    def display_results(self, data):
+        self.progress.stop()
+        self.analyze_button.configure(state="normal", text="🔍 Анализировать")
+        self.paste_button.configure(state="normal")
+        
+        if self.welcome_label.winfo_exists():
+            self.welcome_label.destroy()
+
+        trust = data.get('source_trust', 'неизвестно')
+        color = "#2ecc71" if trust == "высокое" else "#f1c40f" if trust == "среднее" else "#e74c3c"
+        self.add_card("📡 Доверие к источнику", f"Вердикт: {trust.upper()}\n{data.get('source_reason', '')}", color)
+        self.current_report_text += f"📡 Доверие: {trust.upper()}\n{data.get('source_reason', '')}\n\n"
+
+        cb_score = data.get('clickbait_score', 0)
+        cb_color = "#2ecc71" if cb_score < 30 else "#f1c40f" if cb_score < 70 else "#e74c3c"
+        phrases = "\n".join([f"• «{p}»" for p in data.get('clickbait_phrases', [])])
+        self.add_card("🎣 Кликбейт и манипуляции", f"Индекс кликбейта: {cb_score}/100\n\nНайдено:\n{phrases}", cb_color)
+        self.current_report_text += f"🎣 Кликбейт: {cb_score}/100\n{phrases}\n\n"
+
+        explanation = data.get('explanation', '')
+        terms = "\n".join([f"• {t}" for t in data.get('terms', [])])
+        self.add_card("📖 Объяснение происходящего", f"{explanation}\n\nТермины:\n{terms}", "#3498db")
+        self.current_report_text += f"📖 Объяснение: {explanation}\nТермины: {terms}\n\n"
+
+        advice = data.get('action_advice', '')
+        self.add_card("💡 Что делать?", advice, "#9b59b6")
+        self.current_report_text += f"💡 Что делать: {advice}\n"
+
+        self.copy_button = ctk.CTkButton(self.result_frame, text="📋 Скопировать отчет", fg_color="#555555", hover_color="#444444", font=ctk.CTkFont(size=14, weight="bold"), command=self.copy_report)
+        self.copy_button.pack(pady=20, fill="x", padx=5)
+
+    def add_card(self, title, content, color_hex):
+        card = ctk.CTkFrame(self.result_frame, fg_color="transparent", border_width=2, border_color=color_hex, corner_radius=10)
+        card.pack(fill="x", pady=10, padx=5)
+        lbl_title = ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=16, weight="bold"), text_color=color_hex)
+        lbl_title.pack(anchor="w", padx=15, pady=(10, 5))
+        lbl_content = ctk.CTkLabel(card, text=content, wraplength=550, justify="left", font=ctk.CTkFont(size=14))
+        lbl_content.pack(anchor="w", padx=15, pady=(0, 15))
+
+    def display_error(self, error_msg):
+        self.progress.stop()
+        self.analyze_button.configure(state="normal", text="🔍 Анализировать")
+        self.paste_button.configure(state="normal")
+        
+        if self.welcome_label.winfo_exists():
+            self.welcome_label.destroy()
+            
+        self.add_card("⚠️ Ошибка", error_msg, "#e74c3c")
+        
+        retry_button = ctk.CTkButton(self.result_frame, text="🔄 Попробовать снова", fg_color="#3498db", hover_color="#2980b9", command=self.start_analysis)
+        retry_button.pack(pady=10, fill="x", padx=5)
+
+if __name__ == "__main__":
+    app = FactCheckApp()
+    app.mainloop()
