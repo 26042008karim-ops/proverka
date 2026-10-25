@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # --- 1. НАСТРОЙКИ ---
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = ""
 
 os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10808'
 os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10808'
